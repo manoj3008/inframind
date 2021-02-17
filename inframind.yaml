@@ -1,0 +1,223 @@
+Parameters:
+  InstanceType:
+    Description: Wordpress and MySQL Instance Type
+    Type: String
+    Default: t2.micro
+  AMI:
+    Type: String
+    Default: ami-0db0b3ab7df22e366
+    Description: The Ubuntu AMI ID from AWS
+  Key:
+    Type: String
+    Description: The key used to access the instance.
+    Default: infra-mind
+
+
+Resources:
+  PubPrivateVPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: 172.31.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+
+  PublicSubnet:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref PubPrivateVPC
+      AvailabilityZone: ap-south-1a
+      CidrBlock: 172.31.1.0/24
+      MapPublicIpOnLaunch: false
+
+  PrivateSubnet:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref PubPrivateVPC
+      AvailabilityZone: ap-south-1b
+      CidrBlock: 172.31.5.0/24
+      MapPublicIpOnLaunch: false
+
+  InternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Join [_, [!Ref 'AWS::StackName']]
+        - Key: Network
+          Value: Public
+
+  GatewayToInternet:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId: !Ref PubPrivateVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref PubPrivateVPC
+      Tags:
+        - Key: Network
+          Value: Public
+
+  PublicRoute:
+    Type: 'AWS::EC2::Route'
+    DependsOn: GatewayToInternet
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  NatGateway:
+    Type: "AWS::EC2::NatGateway"
+    DependsOn: NatPublicIP
+    Properties: 
+      AllocationId: !GetAtt NatPublicIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+
+  NatPublicIP:
+    Type: "AWS::EC2::EIP"
+    DependsOn: PubPrivateVPC
+    Properties:
+      Domain: vpc
+
+  PrivateRouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref PubPrivateVPC
+      Tags:
+        - Key: Network
+          Value: Private
+
+  PrivateRoute:
+    Type: 'AWS::EC2::Route'
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetRouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  WordPressSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref PubPrivateVPC
+      GroupDescription: Enable HTTP Port from Internet
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+      - IpProtocol: "-1"
+        CidrIp: 0.0.0.0/0
+
+  Wordpress:
+    Type: AWS::EC2::Instance
+    DependsOn: PublicSubnet
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref AMI
+      KeyName: !Ref Key
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !GetAtt [WordPressSG, GroupId]
+    
+
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo apt-get update
+          sudo apt -y install software-properties-common
+          sudo add-apt-repository ppa:ondrej/php
+          sudo apt-get update
+          sudo apt-get install -y apache2 php7.4 php7.4-mysql libapache2-mod-php7.4
+          sudo apt-get install -y php7.4-curl php7.4-gd php7.4-mbstring php7.4-xml php7.4-xmlrpc php7.4-soap php7.4-intl php7.4-zip
+          sudo wget -c https://wordpress.org/latest.tar.gz -O - | sudo tar -xz -C /var/www/html/
+          sudo rm /var/www/html/index.html
+          sudo mv /var/www/html/wordpress/* /var/www/html/
+          sudo chown www-data:www-data -R /var/www/html/
+          sudo find /var/www/html/ -type d -exec chmod 755 {} \;
+          sudo find /var/www/html/ -type f -exec chmod 644 {} \;
+          sudo systemctl restart apache2
+
+      Tags:
+       - Key: Name
+         Value: Wordpress
+
+  WordpressEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      InstanceId: !Ref Wordpress
+
+
+  MySQLSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref PubPrivateVPC
+      GroupDescription: Enable MYSQL Port from Wordpress SG
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 3306
+        ToPort: 3306
+        SourceSecurityGroupId: !GetAtt [WordPressSG, GroupId]
+      SecurityGroupEgress:
+      - IpProtocol: "-1"
+        CidrIp: 0.0.0.0/0
+
+  MySQL:
+    Type: AWS::EC2::Instance
+    DependsOn: PrivateSubnet
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref AMI
+      KeyName: !Ref Key
+      SubnetId: !Ref PrivateSubnet
+      SecurityGroupIds: 
+        - !GetAtt [MySQLSG, GroupId]
+
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo apt update
+          sudo apt install -y mysql-server python3-pymysql
+          sudo mysql -e "SET PASSWORD FOR root@localhost = PASSWORD('InfraMind');FLUSH PRIVILEGES;"
+          sudo mysql -e "DELETE FROM mysql.user WHERE User='';"
+          sudo mysql -e "DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');"
+          sudo mysql -e "DROP DATABASE test;DELETE FROM mysql.db WHERE Db='test' OR Db='test_%';"
+          sudo mysql -e " CREATE DATABASE IF NOT EXISTS inframind"
+          sudo mysql -u root -pInfraMind -e "CREATE USER 'inframind'@'%' IDENTIFIED BY 'InfraMind';GRANT ALL PRIVILEGES ON *.* TO 'inframind'@'%';FLUSH PRIVILEGES;"
+          sudo sed -i "s/.*bind-address.*/bind-address = 0.0.0.0/" /etc/mysql/mysql.conf.d/mysqld.cnf
+          sudo systemctl restart mysql
+
+      Tags:
+      - Key: Name
+        Value: MySQL
+
+Outputs:
+  WordPressPrivateIP:
+    Description: Wordpress Private IP Address
+    Value: !GetAtt Wordpress.PrivateIp
+
+  WordPressPublicIP:
+    Description: Wordpress Elastic IP Address
+    Value: !GetAtt Wordpress.PublicIp
+
+  MySQLPrivateIP:
+    Description: MySQL Private IP Address
+    Value: !GetAtt MySQL.PrivateIp
